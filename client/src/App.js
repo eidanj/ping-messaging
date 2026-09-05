@@ -9,35 +9,36 @@ function getSocket() {
   return socket;
 }
 
-// ── Notification sound (synthesized via Web Audio API — no file needed) ──
+// ── Notification sound — low Discord-style "pop" ──
 function playNotificationSound() {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
 
-    // Discord-style "pop" — two quick tones
-    const play = (freq, startTime, duration, type = 'sine') => {
+    const play = (freq, startTime, duration) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.connect(gain);
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 1200;
+      osc.connect(filter);
+      filter.connect(gain);
       gain.connect(ctx.destination);
-      osc.type = type;
+      osc.type = 'sine';
       osc.frequency.setValueAtTime(freq, startTime);
       gain.gain.setValueAtTime(0, startTime);
-      gain.gain.linearRampToValueAtTime(0.18, startTime + 0.01);
+      gain.gain.linearRampToValueAtTime(0.22, startTime + 0.015);
       gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
       osc.start(startTime);
       osc.stop(startTime + duration);
     };
 
     const now = ctx.currentTime;
-    play(880, now, 0.12);
-    play(1100, now + 0.1, 0.18);
+    // A4 -> C5, spaced and low like Discord
+    play(440, now, 0.18);
+    play(523, now + 0.13, 0.22);
 
-    // Auto-close context after sound finishes
-    setTimeout(() => ctx.close(), 600);
-  } catch (e) {
-    // Audio not available, silently fail
-  }
+    setTimeout(() => ctx.close(), 800);
+  } catch (e) {}
 }
 
 // ── Upload sound (lower blip) ──
