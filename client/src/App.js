@@ -629,6 +629,7 @@ export default function App() {
   const otherIsTyping = activeConvo && Object.entries(typingUsers).some(([uid, t]) => t && uid !== me.id);
   const otherOnline = activeConvo && onlineUsers.has(activeConvo.other?.id);
 
+
   return (
     <><style>{css}</style>
     <div className="app">
@@ -680,12 +681,18 @@ export default function App() {
                 <Avatar user={activeConvo.other} />
                 {otherOnline && <div className="online-dot" />}
               </div>
-              <div>
+              <div style={{flex:1}}>
                 <div className="chat-header-name">{activeConvo.other?.name}</div>
                 <div className={`chat-header-status ${otherOnline?'online':''}`}>
                   {otherOnline ? '🟢 Online' : '⚫ Offline'}
                 </div>
               </div>
+              <ScreenshareManager
+                socket={sock.current}
+                me={me}
+                activeConvo={activeConvo}
+                onlineUsers={onlineUsers}
+              />
             </div>
 
             <div className="messages-wrap">
@@ -763,6 +770,296 @@ export default function App() {
     )}
 
     <Toast toast={toast} />
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────
+// SCREENSHARE — appended below existing exports
+// Uses WebRTC + existing Socket.io for signaling
+// ─────────────────────────────────────────────
+
+// Patch socket to forward WebRTC signaling events
+// (called once after socket connects)
+function attachScreenshareSignaling(socket, handlers) {
+  socket.on('ss:offer',     handlers.onOffer);
+  socket.on('ss:answer',    handlers.onAnswer);
+  socket.on('ss:ice',       handlers.onIce);
+  socket.on('ss:stop',      handlers.onStop);
+  socket.on('ss:request',   handlers.onRequest);
+  socket.on('ss:rejected',  handlers.onRejected);
+}
+
+function detachScreenshareSignaling(socket) {
+  ['ss:offer','ss:answer','ss:ice','ss:stop','ss:request','ss:rejected'].forEach(e => socket.off(e));
+}
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+
+// ── Screenshare CSS (appended to existing <style>) ──
+const screenshareCss = `
+  /* Screenshare request banner */
+  .ss-banner {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 300;
+    background: var(--lapis);
+    border-bottom: 4px solid #0f2470;
+    padding: 14px 20px;
+    display: flex; align-items: center; gap: 14px;
+    font-size: 18px; color: #fff;
+    animation: ss-slide-down .2s ease;
+  }
+  @keyframes ss-slide-down { from { transform: translateY(-100%); } to { transform: none; } }
+  .ss-banner-text { flex: 1; }
+  .ss-banner-name { font-family: 'Press Start 2P', monospace; font-size: 10px; color: var(--gold); margin-bottom: 4px; }
+  .ss-accept { padding: 6px 14px; background: var(--emerald); color: #fff; border: 2px solid #007733; border-top-color: #00ee66; font-family: 'VT323', monospace; font-size: 17px; cursor: pointer; }
+  .ss-accept:hover { filter: brightness(1.15); }
+  .ss-decline { padding: 6px 14px; background: var(--redstone); color: #fff; border: 2px solid #880000; border-top-color: #ff4444; font-family: 'VT323', monospace; font-size: 17px; cursor: pointer; }
+  .ss-decline:hover { filter: brightness(1.15); }
+
+  /* Screenshare viewer overlay */
+  .ss-overlay {
+    position: fixed; inset: 0; z-index: 400;
+    background: #000;
+    display: flex; flex-direction: column;
+  }
+  .ss-overlay-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px;
+    background: var(--dirt);
+    border-bottom: 4px solid var(--dirt-dark);
+    flex-shrink: 0;
+  }
+  .ss-overlay-title { font-family: 'Press Start 2P', monospace; font-size: 10px; color: #fff; flex: 1; }
+  .ss-overlay-status { font-size: 16px; color: var(--gold); }
+  .ss-stop-btn { padding: 6px 14px; background: var(--redstone); color: #fff; border: 2px solid #880000; border-top-color: #ff4444; font-family: 'VT323', monospace; font-size: 17px; cursor: pointer; }
+  .ss-stop-btn:hover { filter: brightness(1.15); }
+  .ss-video-wrap { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .ss-video { max-width: 100%; max-height: 100%; display: block; background: #000; }
+  .ss-footer { padding: 8px 16px; background: var(--hotbar); border-top: 2px solid var(--shadow); font-size: 14px; color: var(--text-dim); text-align: center; }
+
+  /* Screenshare button in chat header */
+  .ss-btn { padding: 5px 12px; background: var(--stone-dark); color: var(--text-dim); border: 2px solid var(--stone); border-top-color: var(--stone-light); font-family: 'VT323', monospace; font-size: 17px; cursor: pointer; transition: all .1s; margin-left: auto; }
+  .ss-btn:hover { background: var(--stone); color: var(--text-light); }
+  .ss-btn.active { background: var(--emerald); color: #fff; border-color: #007733; border-top-color: #00ee66; }
+  .ss-btn:disabled { opacity: .4; cursor: not-allowed; }
+`;
+
+// ── ScreenshareManager component ──
+export function ScreenshareManager({ socket, me, activeConvo, onlineUsers }) {
+  const [state, setState] = useState('idle'); // idle | requesting | sharing | viewing | incoming
+  const [incomingFrom, setIncomingFrom] = useState(null); // { id, name }
+  const peerRef = useRef(null);
+  const streamRef = useRef(null);
+  const localVideoRef = useRef(null);  // sharer sees their own stream minimized
+  const remoteVideoRef = useRef(null); // viewer sees remote stream
+
+  const otherId = activeConvo?.other?.id;
+  const otherName = activeConvo?.other?.name;
+
+  // ── Cleanup helper ──
+  const cleanup = useCallback((notify = false) => {
+    if (notify && socket && otherId) socket.emit('ss:stop', { to: otherId });
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    if (peerRef.current) { peerRef.current.close(); peerRef.current = null; }
+    setState('idle');
+    setIncomingFrom(null);
+  }, [socket, otherId]);
+
+  // ── Build RTCPeerConnection ──
+  function buildPeer() {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc.onicecandidate = (e) => {
+      if (e.candidate && socket && otherId) {
+        socket.emit('ss:ice', { to: otherId, candidate: e.candidate });
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (['failed','disconnected','closed'].includes(pc.connectionState)) cleanup();
+    };
+    return pc;
+  }
+
+  // ── Signaling handlers ──
+  useEffect(() => {
+    if (!socket) return;
+
+    const handlers = {
+      onRequest: ({ from, fromName }) => {
+        // Only show if it's from the person we're chatting with
+        if (from === otherId) {
+          setIncomingFrom({ id: from, name: fromName });
+          setState('incoming');
+        }
+      },
+
+      onOffer: async ({ from, offer }) => {
+        if (from !== otherId) return;
+        const pc = buildPeer();
+        peerRef.current = pc;
+        pc.ontrack = (e) => {
+          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0];
+        };
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('ss:answer', { to: from, answer });
+        setState('viewing');
+      },
+
+      onAnswer: async ({ answer }) => {
+        await peerRef.current?.setRemoteDescription(new RTCSessionDescription(answer));
+      },
+
+      onIce: async ({ candidate }) => {
+        try { await peerRef.current?.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
+      },
+
+      onStop: () => cleanup(),
+      onRejected: () => { cleanup(); setState('idle'); alert(`${otherName} declined the screenshare.`); },
+    };
+
+    attachScreenshareSignaling(socket, handlers);
+    return () => detachScreenshareSignaling(socket);
+  }, [socket, otherId, otherName, cleanup]);
+
+  // ── Set video srcObject when entering viewing state ──
+  useEffect(() => {
+    if (state === 'viewing' && remoteVideoRef.current) {
+      // srcObject may already be set via ontrack
+    }
+  }, [state]);
+
+  // ── Start sharing ──
+  const startShare = async () => {
+    if (!otherId || !onlineUsers.has(otherId)) { alert(`${otherName} is offline.`); return; }
+    setState('requesting');
+    socket.emit('ss:request', { to: otherId, fromName: me.name });
+    // Wait for answer via onAnswer — if no response in 30s, cancel
+    setTimeout(() => {
+      setState(s => s === 'requesting' ? 'idle' : s);
+    }, 30000);
+  };
+
+  // ── Accept incoming ──
+  const acceptShare = async () => {
+    // Signal sharer to send offer
+    socket.emit('ss:accepted', { to: incomingFrom.id });
+
+    // Build peer — offer will arrive via onOffer handler
+    // (sharer listens for ss:accepted then sends offer)
+    setState('connecting');
+  };
+
+  // ── Sharer: listen for acceptance then send offer ──
+  useEffect(() => {
+    if (!socket) return;
+    const onAccepted = async ({ from }) => {
+      if (from !== otherId) return;
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        streamRef.current = stream;
+        const pc = buildPeer();
+        peerRef.current = pc;
+        stream.getTracks().forEach(t => {
+          pc.addTrack(t, stream);
+          t.onended = () => cleanup(true); // user clicked "Stop sharing" in browser UI
+        });
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('ss:offer', { to: from, offer });
+        setState('sharing');
+      } catch (err) {
+        cleanup();
+        if (err.name !== 'NotAllowedError') alert('Could not start screenshare: ' + err.message);
+      }
+    };
+    socket.on('ss:accepted', onAccepted);
+    return () => socket.off('ss:accepted', onAccepted);
+  }, [socket, otherId, cleanup]);
+
+  const declineShare = () => {
+    socket.emit('ss:rejected', { to: incomingFrom.id });
+    setState('idle');
+    setIncomingFrom(null);
+  };
+
+  const stopShare = () => cleanup(true);
+
+  // ── Render ──
+  const otherOnline = otherId && onlineUsers.has(otherId);
+
+  return (
+    <>
+      {/* Button shown in chat header — rendered by parent, exposed via ref */}
+      {/* We expose the button + overlays here as a fragment */}
+
+      {/* Screenshare button — parent imports and places this */}
+      <button
+        id="ss-trigger-btn"
+        className={`ss-btn ${state === 'sharing' ? 'active' : ''}`}
+        onClick={state === 'idle' ? startShare : stopShare}
+        disabled={state === 'requesting' || state === 'connecting' || !activeConvo || !otherOnline}
+        title={!otherOnline ? `${otherName} is offline` : state === 'sharing' ? 'Stop screenshare' : 'Share your screen'}
+        style={{ display: activeConvo ? 'inline-block' : 'none' }}
+      >
+        {state === 'requesting' ? '⏳ Waiting...' :
+         state === 'sharing'    ? '🛑 Stop Share' :
+         state === 'connecting' ? '⏳ Connecting...' :
+                                  '🖥 Share Screen'}
+      </button>
+
+      {/* Incoming request banner */}
+      {state === 'incoming' && incomingFrom && (
+        <div className="ss-banner">
+          <div className="ss-banner-text">
+            <div className="ss-banner-name">⛏ SCREENSHARE REQUEST</div>
+            <div>{incomingFrom.name} wants to share their screen with you</div>
+          </div>
+          <button className="ss-accept" onClick={acceptShare}>✔ Accept</button>
+          <button className="ss-decline" onClick={declineShare}>✕ Decline</button>
+        </div>
+      )}
+
+      {/* Viewer overlay — fullscreen */}
+      {state === 'viewing' && (
+        <div className="ss-overlay">
+          <div className="ss-overlay-header">
+            <div className="ss-overlay-title">🖥 {otherName}'s Screen</div>
+            <div className="ss-overlay-status">● LIVE</div>
+            <button className="ss-stop-btn" onClick={stopShare}>✕ Close</button>
+          </div>
+          <div className="ss-video-wrap">
+            <video
+              ref={remoteVideoRef}
+              className="ss-video"
+              autoPlay
+              playsInline
+            />
+          </div>
+          <div className="ss-footer">You are viewing {otherName}'s screen · Press ✕ to close</div>
+        </div>
+      )}
+
+      {/* Sharer: small preview (optional) */}
+      {state === 'sharing' && (
+        <div style={{
+          position: 'fixed', bottom: 80, right: 16, zIndex: 250,
+          border: '3px solid var(--emerald)', background: '#000',
+          width: 200, fontSize: 13, color: 'var(--text-dim)'
+        }}>
+          <video ref={localVideoRef} style={{ width: '100%', display: 'block' }} autoPlay muted playsInline />
+          <div style={{ padding: '4px 8px', background: 'var(--ui-panel)', textAlign: 'center' }}>
+            🟢 Sharing to {otherName}
+          </div>
+        </div>
+      )}
+
+      {/* Inject screenshare CSS */}
+      <style>{screenshareCss}</style>
     </>
   );
 }

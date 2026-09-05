@@ -328,6 +328,19 @@ io.on('connection', (socket) => {
     io.to(`user:${otherId}`).emit('conversationUpdated', convoKey);
   });
 
+  // ── Screenshare signaling relay ──
+  // Simply forward WebRTC signals between two users — server never touches the content
+  ['ss:request','ss:accepted','ss:rejected','ss:offer','ss:answer','ss:ice','ss:stop'].forEach(event => {
+    socket.on(event, (data) => {
+      if (!authedUserId || !data?.to) return;
+      // Find target socket and forward
+      const targetSocketId = userSockets.get(data.to);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit(event, { ...data, from: authedUserId });
+      }
+    });
+  });
+
   socket.on('typing', ({ convoKey, isTyping }) => {
     if (!authedUserId) return;
     socket.to(`convo:${convoKey}`).emit('typing', { userId: authedUserId, isTyping });
