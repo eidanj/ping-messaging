@@ -197,7 +197,27 @@ app.get('/api/files/:fileId', requireAuth, async (req, res) => {
   res.send(Buffer.from(file.data, 'base64'));
 });
 
-// ── Conversations ──
+// ── TURN credentials from Metered ──
+app.get('/api/turn', requireAuth, async (req, res) => {
+  try {
+    const domain = process.env.METERED_DOMAIN;
+    const key = process.env.METERED_SECRET_KEY;
+    if (!domain || !key) {
+      // Fallback to STUN only if not configured
+      return res.json({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    }
+    const response = await fetch(
+      `https://${domain}/api/v1/turn/credentials?apiKey=${key}`
+    );
+    const iceServers = await response.json();
+    res.json({ iceServers });
+  } catch (err) {
+    console.error('TURN fetch error:', err);
+    res.json({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  }
+});
+
+
 app.get('/api/conversations', requireAuth, async (req, res) => {
   const { rows: convos } = await pool.query(
     `SELECT c.*, 

@@ -693,6 +693,7 @@ export default function App() {
                 me={me}
                 activeConvo={activeConvo}
                 onlineUsers={onlineUsers}
+                token={token}
               />
             </div>
 
@@ -795,10 +796,15 @@ function detachScreenshareSignaling(socket) {
   ['ss:offer','ss:answer','ss:ice','ss:stop','ss:request','ss:rejected'].forEach(e => socket.off(e));
 }
 
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-];
+async function fetchIceServers(token) {
+  try {
+    const res = await fetch(`${API}/api/turn`, { headers: { 'x-auth-token': token } });
+    const data = await res.json();
+    return data.iceServers;
+  } catch {
+    return [{ urls: 'stun:stun.l.google.com:19302' }];
+  }
+}
 
 // ── Screenshare CSS (appended to existing <style>) ──
 const screenshareCss = `
@@ -849,7 +855,7 @@ const screenshareCss = `
 `;
 
 // ── ScreenshareManager component ──
-export function ScreenshareManager({ socket, me, activeConvo, onlineUsers }) {
+export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token }) {
   const [state, setState] = useState('idle'); // idle | requesting | sharing | viewing | incoming
   const [incomingFrom, setIncomingFrom] = useState(null); // { id, name }
   const peerRef = useRef(null);
@@ -870,8 +876,9 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers }) {
   }, [socket, otherId]);
 
   // ── Build RTCPeerConnection ──
-  function buildPeer() {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  async function buildPeer() {
+    const iceServers = await fetchIceServers(token);
+    const pc = new RTCPeerConnection({ iceServers });
     pc.onicecandidate = (e) => {
       if (e.candidate && socket && otherId) {
         socket.emit('ss:ice', { to: otherId, candidate: e.candidate });
@@ -898,7 +905,7 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers }) {
 
       onOffer: async ({ from, offer }) => {
         if (from !== otherId) return;
-        const pc = buildPeer();
+        const pc = await buildPeer();
         peerRef.current = pc;
         pc.ontrack = (e) => {
           if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0];
@@ -962,7 +969,7 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers }) {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
         streamRef.current = stream;
-        const pc = buildPeer();
+        const pc = await buildPeer();
         peerRef.current = pc;
         stream.getTracks().forEach(t => {
           pc.addTrack(t, stream);
