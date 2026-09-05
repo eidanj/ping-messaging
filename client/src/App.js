@@ -880,15 +880,20 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
   // ── Build RTCPeerConnection ──
   async function buildPeer() {
     const iceServers = await fetchIceServers(token);
+    console.log('[SS] ICE servers:', JSON.stringify(iceServers));
     const pc = new RTCPeerConnection({ iceServers });
     pc.onicecandidate = (e) => {
+      console.log('[SS] ICE candidate:', e.candidate?.type, e.candidate?.protocol);
       if (e.candidate && socket && otherId) {
         socket.emit('ss:ice', { to: otherId, candidate: e.candidate });
       }
     };
+    pc.oniceconnectionstatechange = () => console.log('[SS] ICE state:', pc.iceConnectionState);
     pc.onconnectionstatechange = () => {
+      console.log('[SS] Connection state:', pc.connectionState);
       if (['failed','disconnected','closed'].includes(pc.connectionState)) cleanup();
     };
+    pc.onsignalingstatechange = () => console.log('[SS] Signaling state:', pc.signalingState);
     return pc;
   }
 
@@ -910,11 +915,13 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
         const pc = await buildPeer();
         peerRef.current = pc;
         pc.ontrack = (e) => {
-          // Store stream so we can assign it after the video element mounts
+          console.log('[SS] ontrack fired, streams:', e.streams.length, 'tracks:', e.streams[0]?.getTracks().length);
           remoteStreamRef.current = e.streams[0];
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = e.streams[0];
-            remoteVideoRef.current.play().catch(() => {});
+            remoteVideoRef.current.play().then(() => console.log('[SS] video playing')).catch(err => console.error('[SS] play error:', err));
+          } else {
+            console.warn('[SS] video element not mounted yet, will assign on render');
           }
         };
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
