@@ -860,8 +860,9 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
   const [incomingFrom, setIncomingFrom] = useState(null); // { id, name }
   const peerRef = useRef(null);
   const streamRef = useRef(null);
-  const localVideoRef = useRef(null);  // sharer sees their own stream minimized
-  const remoteVideoRef = useRef(null); // viewer sees remote stream
+  const remoteStreamRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
 
   const otherId = activeConvo?.other?.id;
   const otherName = activeConvo?.other?.name;
@@ -871,6 +872,7 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
     if (notify && socket && otherId) socket.emit('ss:stop', { to: otherId });
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
     if (peerRef.current) { peerRef.current.close(); peerRef.current = null; }
+    remoteStreamRef.current = null;
     setState('idle');
     setIncomingFrom(null);
   }, [socket, otherId]);
@@ -908,7 +910,12 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
         const pc = await buildPeer();
         peerRef.current = pc;
         pc.ontrack = (e) => {
-          if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0];
+          // Store stream so we can assign it after the video element mounts
+          remoteStreamRef.current = e.streams[0];
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = e.streams[0];
+            remoteVideoRef.current.play().catch(() => {});
+          }
         };
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
         const answer = await pc.createAnswer();
@@ -933,12 +940,13 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
     return () => detachScreenshareSignaling(socket);
   }, [socket, otherId, otherName, cleanup]);
 
-  // ── Set video srcObject when entering viewing state ──
+  // ── Assign remote stream to video element once it mounts ──
   useEffect(() => {
-    if (state === 'viewing' && remoteVideoRef.current) {
-      // srcObject may already be set via ontrack
+    if (state === 'viewing' && remoteVideoRef.current && remoteStreamRef.current) {
+      remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      remoteVideoRef.current.play().catch(() => {});
     }
-  }, [state]);
+  }, [state, remoteVideoRef.current]);
 
   // ── Start sharing ──
   const startShare = async () => {
@@ -967,7 +975,17 @@ export function ScreenshareManager({ socket, me, activeConvo, onlineUsers, token
     const onAccepted = async ({ from }) => {
       if (from !== otherId) return;
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'monitor', // prefer full screen
+            frameRate: { ideal: 30 },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+          audio: false,
+          selfBrowserSurface: 'exclude', // key fix: exclude sharing this tab
+          surfaceSwitching: 'exclude',
+        });
         streamRef.current = stream;
         const pc = await buildPeer();
         peerRef.current = pc;
